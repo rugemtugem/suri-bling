@@ -1,6 +1,7 @@
 [build]
   publish = "."
   functions = "netlify/functions"
+  environment = { SECRETS_SCAN_OMIT_KEYS = "LOG_LEVEL" }
 
 [[redirects]]
   from = "/.netlify/functions/*"
