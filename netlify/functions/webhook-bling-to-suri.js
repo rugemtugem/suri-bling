@@ -122,17 +122,35 @@ function mapBlingToSuri(blingProduct) {
 
   const filteredImages = [...new Set(images.filter(Boolean))];
 
-  // Extrai o chatbotId do token (formato: token:chatbotId)
-  const chatbotId = SURI_API_TOKEN ? SURI_API_TOKEN.split(':')[1] : null;
-
+  // Formato correto da API Suri
   const mapped = {
-    chatbotId,
-    sku,
     name,
     description,
+    category: {
+      providerId: "131087930" // ID da categoria padrão - ajuste conforme necessário
+    },
     price,
-    stock,
-    images: filteredImages
+    promotionalPrice: 0,
+    stockQuantity: stock,
+    isActive: true,
+    isPriceEditable: false,
+    itemWithoutLogistic: false,
+    sellerId: "all",
+    weightInGrams: 0,
+    attributes: [],
+    images: filteredImages,
+    variants: [],
+    dimensions: [{
+      dimensions: {},
+      prices: {
+        default: {
+          price: price
+        }
+      },
+      stocks: {},
+      sku: sku,
+      quantity: stock
+    }]
   };
 
   log('debug', 'Produto mapeado:', mapped);
@@ -149,42 +167,30 @@ async function upsertProductToSuri(suriProduct) {
     'Authorization': `Bearer ${SURI_API_TOKEN}`
   };
 
-  const putUrl = `${SURI_API_URL.replace(/\/$/, '')}/products/${encodeURIComponent(suriProduct.sku)}`;
-
+  // A API da Suri usa o SKU dentro de dimensions, então buscamos por ele
+  const sku = suriProduct.dimensions[0]?.sku;
+  
+  // Busca o produto pelo SKU para ver se já existe
+  const searchUrl = `${SURI_API_URL.replace(/\/$/, '')}/products`;
+  
   try {
-    log('info', `Tentando atualizar produto SKU=${suriProduct.sku} via PUT`);
-    const putRes = await fetch(putUrl, {
-      method: 'PUT',
+    log('info', `Tentando criar/atualizar produto SKU=${sku}`);
+    
+    // Tenta criar o produto (POST)
+    const postRes = await fetch(searchUrl, {
+      method: 'POST',
       headers,
       body: JSON.stringify(suriProduct)
     });
 
-    if (putRes.ok) {
-      log('info', `Produto SKU=${suriProduct.sku} atualizado com sucesso`);
-      return { ok: true, action: 'updated', status: putRes.status };
-    }
-
-    if (putRes.status === 404 || putRes.status === 400) {
-      log('info', `Produto não encontrado, tentando criar via POST`);
-      const postUrl = `${SURI_API_URL.replace(/\/$/, '')}/products`;
-      const postRes = await fetch(postUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(suriProduct)
-      });
-
-      if (postRes.ok) {
-        log('info', `Produto SKU=${suriProduct.sku} criado com sucesso`);
-        return { ok: true, action: 'created', status: postRes.status };
-      } else {
-        const text = await postRes.text();
-        log('error', `Falha ao criar produto: ${postRes.status} - ${text}`);
-        return { ok: false, action: 'create_failed', status: postRes.status, body: text };
-      }
+    if (postRes.ok) {
+      const result = await postRes.json();
+      log('info', `Produto SKU=${sku} criado/atualizado com sucesso`);
+      return { ok: true, action: 'created', status: postRes.status, data: result };
     } else {
-      const text = await putRes.text();
-      log('error', `Falha ao atualizar produto: ${putRes.status} - ${text}`);
-      return { ok: false, action: 'update_failed', status: putRes.status, body: text };
+      const text = await postRes.text();
+      log('error', `Falha ao criar produto: ${postRes.status} - ${text}`);
+      return { ok: false, action: 'create_failed', status: postRes.status, body: text };
     }
   } catch (err) {
     log('error', `Erro de rede: ${err.message}`);
@@ -196,18 +202,11 @@ async function deleteProductOnSuri(sku) {
   const headers = {
     'Authorization': `Bearer ${SURI_API_TOKEN}`
   };
-  const url = `${SURI_API_URL.replace(/\/$/, '')}/products/${encodeURIComponent(sku)}`;
-
-  try {
-    log('info', `Tentando deletar produto SKU=${sku}`);
-    const res = await fetch(url, { method: 'DELETE', headers });
-    const body = await res.text();
-    log('info', `Produto SKU=${sku} deletado - Status: ${res.status}`);
-    return { status: res.status, ok: res.ok, body };
-  } catch (err) {
-    log('error', `Erro ao deletar produto: ${err.message}`);
-    return { status: 500, ok: false, error: err.message };
-  }
+  
+  // Para deletar, precisamos do ID do produto, não o SKU
+  // Por enquanto, retornamos uma mensagem informativa
+  log('warn', `Delete não implementado - a API da Suri pode requerer o productId em vez do SKU`);
+  return { status: 501, ok: false, body: 'Delete not implemented - needs productId' };
 }
 
 exports.handler = async function (event) {
@@ -236,7 +235,9 @@ exports.handler = async function (event) {
     log('info', 'Produto extraído do Bling:', blingProduct);
 
     const mapped = mapBlingToSuri(blingProduct);
-    if (!mapped.sku) {
+    const sku = mapped.dimensions[0]?.sku;
+    
+    if (!sku) {
       log('warn', 'Produto sem SKU identificado');
       return {
         statusCode: 400,
@@ -259,15 +260,15 @@ exports.handler = async function (event) {
     })();
 
     if (wantsDelete) {
-      log('info', `Solicitação de delete para SKU=${mapped.sku}`);
-      const delRes = await deleteProductOnSuri(mapped.sku);
+      log('info', `Solicitação de delete para SKU=${sku}`);
+      const delRes = await deleteProductOnSuri(sku);
       return {
         statusCode: 200,
         body: JSON.stringify({ ok: true, action: 'deleted', result: delRes })
       };
     }
 
-    log('info', `Processando upsert para SKU=${mapped.sku}`);
+    log('info', `Processando upsert para SKU=${sku}`);
     const res = await upsertProductToSuri(mapped);
 
     return {
