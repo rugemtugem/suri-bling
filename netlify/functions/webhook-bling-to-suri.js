@@ -131,15 +131,11 @@ function mapBlingToSuri(blingProduct) {
     },
     price,
     promotionalPrice: 0,
-    stockQuantity: stock,
     isActive: true,
-    isPriceEditable: false,
-    itemWithoutLogistic: false,
-    sellerId: "all",
-    weightInGrams: 0,
     attributes: [],
-    images: filteredImages,
     variants: [],
+    images: filteredImages,
+    stockQuantity: stock,
     dimensions: [{
       dimensions: {},
       prices: {
@@ -149,8 +145,18 @@ function mapBlingToSuri(blingProduct) {
       },
       stocks: {},
       sku: sku,
-      quantity: stock
-    }]
+      measurements: {
+        weightInGrams: 0,
+        heightInCm: 0,
+        widthInCm: 0,
+        lengthInCm: 0,
+        unitsPerPackage: 0
+      }
+    }],
+    sellerId: "all",
+    weightInGrams: 0,
+    itemWithoutLogistic: false,
+    isPriceEditable: false
   };
 
   log('debug', 'Produto mapeado:', mapped);
@@ -170,14 +176,14 @@ async function upsertProductToSuri(suriProduct) {
   // A API da Suri usa o SKU dentro de dimensions, então buscamos por ele
   const sku = suriProduct.dimensions[0]?.sku;
   
-  // Busca o produto pelo SKU para ver se já existe
-  const searchUrl = `${SURI_API_URL.replace(/\/$/, '')}/products`;
+  // URL correta: /shop/product (SEM o 's' no final)
+  const productUrl = `${SURI_API_URL.replace(/\/$/, '')}/product`;
   
   try {
     log('info', `Tentando criar/atualizar produto SKU=${sku}`);
     
     // Tenta criar o produto (POST)
-    const postRes = await fetch(searchUrl, {
+    const postRes = await fetch(productUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(suriProduct)
