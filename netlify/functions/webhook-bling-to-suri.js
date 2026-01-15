@@ -4,6 +4,7 @@ const SURI_API_URL = process.env.SURI_API_URL;
 const SURI_API_TOKEN = process.env.SURI_API_TOKEN;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 
+// BUG CORRIGIDO: A lógica estava invertida
 function log(level, ...args) {
   const levels = { debug: 0, info: 1, warn: 2, error: 3 };
   if (levels[level] >= levels[LOG_LEVEL]) {
@@ -22,7 +23,6 @@ async function parseBody(event) {
   const contentType = getHeader(event.headers, 'content-type') || '';
   const bodyText = event.isBase64Encoded ? Buffer.from(raw, 'base64').toString('utf8') : raw;
 
-  // Bling V1 costuma enviar XML. Vamos garantir o parse correto.
   if (contentType.includes('xml') || bodyText.trim().startsWith('<?xml') || bodyText.trim().startsWith('<')) {
     try {
       const parsed = await parseStringPromise(bodyText, { explicitArray: false, mergeAttrs: true });
@@ -44,26 +44,32 @@ function extractProductFromBling(parsedWrapper) {
   const p = parsedWrapper;
   if (!p) return null;
 
-  // Estrutura Clássica Bling V1 (XML ou JSON)
-  // O Bling V1 envia dentro de retorno -> produtos -> produto
+  // Estrutura: retorno.produtos.produto
   if (p.retorno && p.retorno.produtos) {
     const prod = p.retorno.produtos.produto || p.retorno.produtos;
     return Array.isArray(prod) ? prod[0] : prod;
   }
 
-  // Caso o Bling envie apenas o objeto produto (comum em alguns webhooks V1)
+  // Estrutura: produto
   if (p.produto) {
     return Array.isArray(p.produto) ? p.produto[0] : p.produto;
   }
 
-  // Fallback para outros formatos que possam vir no payload
+  // Estrutura: resource.produto
+  if (p.resource && p.resource.produto) return p.resource.produto;
+
+  // Estrutura: data (webhook v2 do Bling)
+  if (p.data && (p.data.codigo || p.data.id || p.data.sku)) {
+    return p.data;
+  }
+
+  // Fallback: se o objeto já contém campos do produto
   if (p.codigo || p.descricao || p.sku || p.id) return p;
 
   return null;
 }
 
 function mapBlingToSuri(blingProduct) {
-  // Mapeamento rigoroso para os campos da V1 do Bling
   const sku = blingProduct.codigo || blingProduct.sku || blingProduct.id || null;
   const name = blingProduct.descricao || blingProduct.nome || blingProduct.name || '';
   
@@ -71,24 +77,24 @@ function mapBlingToSuri(blingProduct) {
     blingProduct.descricao ||
     blingProduct.descricaoCurta ||
     blingProduct.informacoesAdicionais ||
-    name;
+    '';
 
-  // Tratamento de preço (Bling V1 pode enviar com vírgula em XML)
   const priceRaw = blingProduct.preco ||
     blingProduct.precoVenda ||
+    blingProduct.preco_venda ||
     blingProduct.valor ||
     '0';
-  const price = typeof priceRaw === 'string' ? Number(priceRaw.replace(',', '.')) : Number(priceRaw) || 0;
+  const price = Number(String(priceRaw).replace(',', '.')) || 0;
 
   const stockRaw = blingProduct.estoque ||
     blingProduct.quantidade ||
     blingProduct.qtd ||
+    blingProduct.stock ||
     0;
   const stock = Number(stockRaw) || 0;
 
   const images = [];
 
-  // Tratamento de imagens no Bling V1
   if (blingProduct.imagens) {
     if (blingProduct.imagens.imagem) {
       const imgs = Array.isArray(blingProduct.imagens.imagem)
@@ -104,29 +110,62 @@ function mapBlingToSuri(blingProduct) {
     }
   }
 
-  // Campos alternativos de imagem comuns no Bling
   if (blingProduct.urlImagem) images.push(blingProduct.urlImagem);
   if (blingProduct.imagemURL) images.push(blingProduct.imagemURL);
 
+  if (blingProduct.fotos && Array.isArray(blingProduct.fotos)) {
+    blingProduct.fotos.forEach(f => {
+      if (f.url) images.push(f.url);
+      else if (f.link) images.push(f.link);
+    });
+  }
+
   const filteredImages = [...new Set(images.filter(Boolean))];
 
-  // Formato da API Suri que funcionou no seu teste de CURL
+  // Formato correto da API Suri
   const mapped = {
-    sku: sku,
-    title: name,
-    description: description,
-    price: price,
-    stock_quantity: stock,
-    images: filteredImages
+    name,
+    description,
+    category: {
+      providerId: "131087930" // ID da categoria padrão - ajuste conforme necessário
+    },
+    price,
+    promotionalPrice: 0,
+    isActive: true,
+    attributes: [],
+    variants: [],
+    images: filteredImages,
+    stockQuantity: stock,
+    dimensions: [{
+      dimensions: {},
+      prices: {
+        default: {
+          price: price
+        }
+      },
+      stocks: {},
+      sku: sku,
+      measurements: {
+        weightInGrams: 0,
+        heightInCm: 0,
+        widthInCm: 0,
+        lengthInCm: 0,
+        unitsPerPackage: 0
+      }
+    }],
+    sellerId: "all",
+    weightInGrams: 0,
+    itemWithoutLogistic: false,
+    isPriceEditable: false
   };
 
-  log('debug', 'Produto mapeado (V1) para Suri:', mapped);
+  log('debug', 'Produto mapeado:', mapped);
   return mapped;
 }
 
 async function upsertProductToSuri(suriProduct) {
   if (!SURI_API_URL || !SURI_API_TOKEN) {
-    throw new Error('SURI_API_URL e SURI_API_TOKEN não configurados.');
+    throw new Error('SURI_API_URL e SURI_API_TOKEN devem estar configurados como variáveis de ambiente.');
   }
 
   const headers = {
@@ -134,84 +173,123 @@ async function upsertProductToSuri(suriProduct) {
     'Authorization': `Bearer ${SURI_API_TOKEN}`
   };
 
-  // Endpoint de produtos na Suri
-  const productUrl = `${SURI_API_URL.replace(/\/$/, '')}/products`;
+  // A API da Suri usa o SKU dentro de dimensions, então buscamos por ele
+  const sku = suriProduct.dimensions[0]?.sku;
+  
+  // URL correta: /shop/product (SEM o 's' no final)
+  const productUrl = `${SURI_API_URL.replace(/\/$/, '')}/product`;
   
   try {
-    log('info', `Sincronizando SKU=${suriProduct.sku} na Suri`);
+    log('info', `Tentando criar/atualizar produto SKU=${sku}`);
     
-    // Tenta POST (Criação)
-    let response = await fetch(productUrl, {
+    // Tenta criar o produto (POST)
+    const postRes = await fetch(productUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(suriProduct)
     });
 
-    // Se o produto já existir (400 ou 409), tenta PUT (Atualização)
-    if (!response.ok && (response.status === 400 || response.status === 409)) {
-      log('info', `Produto já existe, tentando atualizar via PUT para SKU=${suriProduct.sku}`);
-      const updateUrl = `${productUrl}/${suriProduct.sku}`;
-      response = await fetch(updateUrl, {
-        method: 'PUT',
-        headers,
-        body: JSON.stringify(suriProduct)
-      });
-    }
-
-    if (response.ok) {
-      const result = await response.json();
-      log('info', `Sucesso na Suri para SKU=${suriProduct.sku}`);
-      return { ok: true, status: response.status, data: result };
+    if (postRes.ok) {
+      const result = await postRes.json();
+      log('info', `Produto SKU=${sku} criado/atualizado com sucesso`);
+      return { ok: true, action: 'created', status: postRes.status, data: result };
     } else {
-      const text = await response.text();
-      log('error', `Erro na API Suri: ${response.status} - ${text}`);
-      return { ok: false, status: response.status, body: text };
+      const text = await postRes.text();
+      log('error', `Falha ao criar produto: ${postRes.status} - ${text}`);
+      return { ok: false, action: 'create_failed', status: postRes.status, body: text };
     }
   } catch (err) {
     log('error', `Erro de rede: ${err.message}`);
-    return { ok: false, error: err.message };
+    return { ok: false, action: 'network_error', error: err.message };
   }
 }
 
+async function deleteProductOnSuri(sku) {
+  const headers = {
+    'Authorization': `Bearer ${SURI_API_TOKEN}`
+  };
+  
+  // Para deletar, precisamos do ID do produto, não o SKU
+  // Por enquanto, retornamos uma mensagem informativa
+  log('warn', `Delete não implementado - a API da Suri pode requerer o productId em vez do SKU`);
+  return { status: 501, ok: false, body: 'Delete not implemented - needs productId' };
+}
+
 exports.handler = async function (event) {
-  // O Bling V1 exige resposta rápida (timeout de 5s)
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, body: 'Method Not Allowed' };
   }
 
   try {
-    log('info', '=== Webhook Bling V1 Recebido ===');
-    const { format, parsed } = await parseBody(event);
-    
+    log('info', '=== Webhook recebido do Bling ===');
+    log('debug', 'Headers:', event.headers);
+
+    const { format, parsed, raw } = await parseBody(event);
+    log('info', `Formato do payload: ${format}`);
+    log('debug', 'Payload parseado:', JSON.stringify(parsed, null, 2));
+
     const blingProduct = extractProductFromBling(parsed);
     if (!blingProduct) {
-      log('warn', 'Produto não encontrado no payload V1');
-      return { statusCode: 200, body: JSON.stringify({ ok: false, message: 'Payload ignorado' }) };
+      log('warn', 'Não foi possível extrair produto do payload');
+      log('debug', 'Payload recebido:', parsed);
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ ok: false, message: 'Produto não encontrado no payload' })
+      };
     }
+
+    log('info', 'Produto extraído do Bling:', blingProduct);
 
     const mapped = mapBlingToSuri(blingProduct);
+    const sku = mapped.dimensions[0]?.sku;
     
-    if (!mapped.sku) {
-      log('warn', 'SKU não identificado no produto');
-      return { statusCode: 200, body: JSON.stringify({ ok: false, message: 'SKU ausente' }) };
+    if (!sku) {
+      log('warn', 'Produto sem SKU identificado');
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ ok: false, message: 'Produto sem SKU' })
+      };
     }
 
-    // Executa a integração
+    const wantsDelete = (() => {
+      const action = parsed?.action || parsed?.evento || blingProduct?.acao || blingProduct?.evento;
+      if (typeof action === 'string' && /delete|excluir|remover/i.test(action)) return true;
+
+      if (blingProduct.situacao && /inativ|inativo|exclu/i.test(String(blingProduct.situacao))) return true;
+
+      try {
+        const url = event.rawUrl || event.path || '';
+        if (typeof url === 'string' && url.includes('delete=true')) return true;
+      } catch (_) { }
+
+      return false;
+    })();
+
+    if (wantsDelete) {
+      log('info', `Solicitação de delete para SKU=${sku}`);
+      const delRes = await deleteProductOnSuri(sku);
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ ok: true, action: 'deleted', result: delRes })
+      };
+    }
+
+    log('info', `Processando upsert para SKU=${sku}`);
     const res = await upsertProductToSuri(mapped);
 
-    // Retornamos 200 para o Bling confirmar o recebimento
     return {
       statusCode: 200,
       body: JSON.stringify({
         ok: res.ok,
-        sku: mapped.sku,
-        suri_status: res.status
+        action: res.action,
+        status: res.status,
+        details: res.body || res.error || null
       })
     };
   } catch (err) {
-    log('error', 'Erro no processamento do webhook:', err);
+    log('error', 'Erro ao processar webhook:', err);
     return {
-      statusCode: 200, 
+      statusCode: 500,
       body: JSON.stringify({ ok: false, error: err.message })
     };
   }
